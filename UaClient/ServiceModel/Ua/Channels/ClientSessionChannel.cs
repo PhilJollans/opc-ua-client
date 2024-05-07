@@ -255,7 +255,11 @@ namespace Workstation.ServiceModel.Ua.Channels
         /// <inheritdoc/>
         public IDisposable Subscribe(IObserver<PublishResponse> observer)
         {
-            return this.AsObservable().Subscribe(observer);
+            var block_buffer = new BufferBlock<PublishResponse>();
+            this.LinkTo ( block_buffer ) ;
+            return block_buffer.AsObservable().Subscribe(observer) ;
+
+            //return this.AsObservable().Subscribe(observer);
         }
 
         /// <inheritdoc/>
@@ -342,7 +346,7 @@ namespace Workstation.ServiceModel.Ua.Channels
                     LocalCertificate = tuple.Certificate?.GetEncoded();
                     LocalPrivateKey = tuple.Key;
                 }
-            
+
                 var cert = RemoteCertificate != null ? _certificateParser.ReadCertificate(RemoteCertificate) : null;
                 RemotePublicKey = cert?.GetPublicKey() as RsaKeyParameters;
 
@@ -827,8 +831,8 @@ namespace Workstation.ServiceModel.Ua.Channels
                             ReturnDiagnostics = _options.DiagnosticsHint
                         },
                         SubscriptionAcknowledgements = publishResponse.NotificationMessage?.NotificationData != null
-                        ? new[] 
-                        { 
+                        ? new[]
+                        {
                             new SubscriptionAcknowledgement
                             {
                                 SequenceNumber = publishResponse.NotificationMessage.SequenceNumber,
@@ -853,67 +857,163 @@ namespace Workstation.ServiceModel.Ua.Channels
         }
 
         /// <summary>
+        /// Function which can be used in a TransformBlock to send a new PublishRequest
+        /// including an acknowledgement for the PublishResponse provided as a parameter.
+        /// </summary>
+        /// <param name="publishResponse"></param>
+        /// <returns>The PublishResponse provided as a parameter.</returns>
+        private PublishResponse AcknowledgeAndRequest ( PublishResponse publishResponse )
+        {
+            var publishRequest = new PublishRequest
+            {
+                RequestHeader = new RequestHeader
+                {
+                    TimeoutHint = _publishTimeoutHint,
+                    ReturnDiagnostics = _options.DiagnosticsHint
+                },
+                SubscriptionAcknowledgements = publishResponse.NotificationMessage?.NotificationData != null
+                ? new[]
+                {
+                    new SubscriptionAcknowledgement
+                    {
+                        SequenceNumber = publishResponse.NotificationMessage.SequenceNumber,
+                        SubscriptionId = publishResponse.SubscriptionId
+                    }
+                }
+                : Array.Empty<SubscriptionAcknowledgement>()
+            };
+
+            var t = this.PublishAsync(publishRequest, _stateMachineCts.Token);
+
+            return publishResponse ;
+        }
+
+        /// <summary>
+        /// Function which can be used in a TransformBlock to log changes to modified itens
+        /// </summary>
+        /// <param name="publishResponse"></param>
+        /// <returns>The PublishResponse provided as a parameter.</returns>
+        private PublishResponse LogMonitoredItems ( PublishResponse publishResponse )
+        {
+            _logger?.LogTrace($"ClientSessionChannel.LogMonitoredItems Received SequenceNumber {publishResponse.NotificationMessage?.SequenceNumber}");
+
+            var notifDataArray = publishResponse.NotificationMessage?.NotificationData ;
+            if ( notifDataArray != null )
+            {
+                foreach ( NotificationData? notifData in notifDataArray )
+                {
+                    if ( notifData is DataChangeNotification dcn )
+                    {
+                        var monItems = dcn.MonitoredItems ;
+                        if ( monItems != null )
+                        {
+                            foreach ( var monItem in monItems )
+                            {
+                                _logger?.LogTrace($"PublishAsync: {monItem?.ClientHandle}, Value: {monItem?.Value}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            return publishResponse ;
+        }
+
+        private void SendNewPublishRequest(CancellationToken token = default)
+        {
+            var publishRequest = new PublishRequest
+            {
+                RequestHeader = new RequestHeader { TimeoutHint = _publishTimeoutHint, ReturnDiagnostics = _options.DiagnosticsHint },
+                SubscriptionAcknowledgements = Array.Empty<SubscriptionAcknowledgement>()
+            };
+            var t = this.PublishAsync(publishRequest, token);
+        }
+
+        private async Task SetupPublishDataflow(CancellationToken token = default)
+        {
+            var linkOptions = new DataflowLinkOptions {  PropagateCompletion = true } ;
+
+            var loggingBlock = new TransformBlock<PublishResponse,PublishResponse>  ( pr => LogMonitoredItems(pr) ) ;
+            var acknowledgeBlock = new TransformBlock<PublishResponse,PublishResponse>  ( pr => AcknowledgeAndRequest(pr) ) ;
+
+            _pubResponsesInternal.LinkTo(loggingBlock, linkOptions) ;
+            loggingBlock.LinkTo(acknowledgeBlock, linkOptions) ;
+            acknowledgeBlock.LinkTo(_publishResponses, linkOptions) ;
+
+            // Send three requests
+            SendNewPublishRequest(token) ;
+            SendNewPublishRequest(token) ;
+            SendNewPublishRequest(token) ;
+
+            // To do: Actually check the cancellation token somewhere and end the dataflow.
+            // In ClientSecureChannel.ReceiveResponsesAsync, if cancellation is requested it will complete the dataflow block.
+            await acknowledgeBlock.Completion ;
+        }
+
+        /// <summary>
         /// The state machine manages the state of the channel.
         /// </summary>
         /// <param name="token">A cancellation token.</param>
         /// <returns>A task.</returns>
         private async Task StateMachineAsync(CancellationToken token = default)
         {
-            var tasks = new[]
-            {
-                PublishAsync(token),
-                PublishAsync(token),
-                PublishAsync(token),
-            };
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            //var tasks = new[]
+            //{
+            //    PublishAsync(token),
+            //    PublishAsync(token),
+            //    PublishAsync(token),
+            //};
+            //await Task.WhenAll(tasks).ConfigureAwait(false);
+
+            await SetupPublishDataflow(token) ;
         }
 
 
         /// <summary>
-        /// Ensures that the server certificate returned in a <see cref="CreateSessionResponse"/> 
-        /// matches the <see cref="EndpointDescription.ServerCertificate"/> for the remote 
+        /// Ensures that the server certificate returned in a <see cref="CreateSessionResponse"/>
+        /// matches the <see cref="EndpointDescription.ServerCertificate"/> for the remote
         /// endpoint (if required based on security policies).
         /// </summary>
         /// <param name="sessionCertificate">
         /// The server certificate returned in a <see cref="CreateSessionResponse"/>.
         /// </param>
         /// <exception cref="ServiceResultException">
-        /// A certificate check is required and the <paramref name="sessionCertificate"/> does not 
+        /// A certificate check is required and the <paramref name="sessionCertificate"/> does not
         /// match the <see cref="EndpointDescription.ServerCertificate"/> for the remote endpoint.
         /// </exception>
         /// <remarks>
-        /// OPC 10000-4 specifies that the client should ignore the server certificate returned by 
-        /// a create session response when the security policy for the server is None and none of 
+        /// OPC 10000-4 specifies that the client should ignore the server certificate returned by
+        /// a create session response when the security policy for the server is None and none of
         /// the user token policies requires encryption.
         /// </remarks>
-        private void ThrowOnInvalidSessionServerCertificate(byte[]? sessionCertificate) 
+        private void ThrowOnInvalidSessionServerCertificate(byte[]? sessionCertificate)
         {
             var compareCertificates = false;
 
-            if (!string.Equals(this.RemoteEndpoint.SecurityPolicyUri, SecurityPolicyUris.None)) 
+            if (!string.Equals(this.RemoteEndpoint.SecurityPolicyUri, SecurityPolicyUris.None))
             {
                 // Verification required if the security policy for the endpoint is not None.
                 compareCertificates = true;
             }
-            else if (this.RemoteEndpoint.UserIdentityTokens != null) 
+            else if (this.RemoteEndpoint.UserIdentityTokens != null)
             {
                 // Check if any of the user token policies require encryption.
-                foreach (var policy in this.RemoteEndpoint.UserIdentityTokens) 
-                { 
-                    if (policy == null) 
+                foreach (var policy in this.RemoteEndpoint.UserIdentityTokens)
+                {
+                    if (policy == null)
                     {
                         continue;
                     }
 
-                    // If the policy does not define its own security policy, inherit the security 
+                    // If the policy does not define its own security policy, inherit the security
                     // policy for the endpoint.
                     var securityPolicyUri = string.IsNullOrWhiteSpace(policy.SecurityPolicyUri)
                         ? this.RemoteEndpoint.SecurityPolicyUri
                         : policy.SecurityPolicyUri;
 
-                    if (!string.Equals(securityPolicyUri, SecurityPolicyUris.None)) 
+                    if (!string.Equals(securityPolicyUri, SecurityPolicyUris.None))
                     {
-                        // User token policy requires encryption, so we need to verify the 
+                        // User token policy requires encryption, so we need to verify the
                         // session certificate.
                         compareCertificates = true;
                         break;
@@ -921,14 +1021,14 @@ namespace Workstation.ServiceModel.Ua.Channels
                 }
             }
 
-            if (compareCertificates) 
+            if (compareCertificates)
             {
                 var isValid = this.RemoteEndpoint.ServerCertificate == null || sessionCertificate == null
                     ? this.RemoteEndpoint.ServerCertificate == null && sessionCertificate == null // Valid if both certificates are null
                     : this.RemoteEndpoint.ServerCertificate.SequenceEqual(sessionCertificate); // Valid if both certificates are equal
 
-                if (!isValid) 
-                { 
+                if (!isValid)
+                {
                     throw new ServiceResultException(StatusCodes.BadCertificateInvalid, "Server did not return the same certificate used to create the channel.");
                 }
             }

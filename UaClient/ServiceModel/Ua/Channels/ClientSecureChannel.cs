@@ -41,6 +41,9 @@ namespace Workstation.ServiceModel.Ua.Channels
         private readonly ActionBlock<ServiceOperation> _pendingRequests;
         private readonly ConcurrentDictionary<uint, ServiceOperation> _pendingCompletions;
 
+        // Publish Responses to be handled by the derived class ClientSessionChannel.
+        protected readonly BufferBlock<PublishResponse> _pubResponsesInternal = new BufferBlock<PublishResponse>() ;
+
         private int _handle;
         private Task? _receiveResponsesTask;
 
@@ -409,6 +412,11 @@ namespace Workstation.ServiceModel.Ua.Channels
                         else
                         {
                             tcs.TrySetResult(response);
+
+                            if ( response is PublishResponse pubRes )
+                            {
+                                _pubResponsesInternal.Post ( pubRes ) ;
+                            }
                         }
 
                         continue;
@@ -441,6 +449,12 @@ namespace Workstation.ServiceModel.Ua.Channels
                             }
                         }
                     }
+                }
+
+                if ( token.IsCancellationRequested )
+                {
+                    // If cancelation is requested, then complete the _publishResponses dataflow block.
+                    _pubResponsesInternal.Complete();
                 }
             }
             catch (Exception ex)
